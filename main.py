@@ -10,12 +10,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Бот живой! v3.4"
+    return "✅ Бот живой! v3.6 — 4 независимых сигнала"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 THRESHOLD = 7.0
-TOP_SYMBOLS = 50
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     print("❌ Ошибка: добавь TELEGRAM_TOKEN и CHAT_ID")
@@ -24,19 +23,17 @@ if not TELEGRAM_TOKEN or not CHAT_ID:
 exchange = ccxt.mexc()
 markets = exchange.load_markets()
 
-# Топ-50 самых ликвидных
+# Топ-50 ликвидных
 sorted_markets = sorted(
     [m for m in markets.values() if m.get('active') and m.get('type') == 'swap' and m.get('quote') == 'USDT'],
     key=lambda x: float(x.get('info', {}).get('volume24', 0) or 0),
     reverse=True
 )
-symbols = [m['symbol'] for m in sorted_markets[:TOP_SYMBOLS]]
+symbols = [m['symbol'] for m in sorted_markets[:50]]
 
-print(f"✅ Бот запущен (топ-{TOP_SYMBOLS} самых ликвидных фьючерсов)")
+print(f"✅ Бот v3.6 запущен (4 независимых сигнала, топ-50)")
 
 sent_pump_dump = set()
-sent_condition = set()
-prev_oi = {}
 
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -47,29 +44,34 @@ def calculate_rsi(closes, period=14):
     avg_loss = sum(losses[-period:]) / period or 0.0001
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
-def calculate_cvd(ohlcv, sensitivity=1.5):   # ← подкрутили до 1.5 (меньше ложных)
-    if len(ohlcv) < 6:
-        return False
+def calculate_cvd_long(ohlcv):
+    if len(ohlcv) < 6: return False
     cvd = []
-    cumulative = 0.0
+    cum = 0.0
     for c in ohlcv:
         delta = c[5] if c[4] >= c[1] else -c[5]
-        cumulative += delta
-        cvd.append(cumulative)
-    # Разворот: падал → развернулся вверх
+        cum += delta
+        cvd.append(cum)
     return (cvd[-3] > cvd[-2] < cvd[-1]) and cvd[-1] > 0
+
+def calculate_cvd_short(ohlcv):
+    if len(ohlcv) < 6: return False
+    cvd = []
+    cum = 0.0
+    for c in ohlcv:
+        delta = c[5] if c[4] >= c[1] else -c[5]
+        cum += delta
+        cvd.append(cum)
+    return (cvd[-3] < cvd[-2] > cvd[-1]) and cvd[-1] < 0
 
 def send_msg(text):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10
-        )
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
     except: pass
 
 def bot_loop():
-    send_msg("🤖 <b>MEXC Signal Bot v3.4 запущен!</b>\nТоп-50 ликвидных фьючерсов\nCVD sensitivity = 1.5")
+    send_msg("🤖 <b>Бот v3.6 запущен</b>\n4 независимых сигнала:\n🔥 Памп 7%\n❄️ Дамп 7%\n🚨 Сильный Лонг (3+)\n❄️ Сильный Шорт (4+)")
 
     while True:
         for symbol in symbols:
@@ -81,52 +83,44 @@ def bot_loop():
                 ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=20)
                 if len(ohlcv) < 8: continue
 
-                closes = [c[4] for c in ohlcv]
                 prev_close = ohlcv[-2][4]
                 candle_ts = ohlcv[-1][0]
                 percent = (current_price - prev_close) / prev_close * 100
                 time_str = datetime.utcfromtimestamp(candle_ts / 1000).strftime('%d.%m %H:%M UTC')
                 tv = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
 
-                # Простой памп / дамп
-                pump_key = (symbol, candle_ts)
-                if abs(percent) >= THRESHOLD and pump_key not in sent_pump_dump:
+                key = (symbol, candle_ts)
+
+                # 1 & 2. ПРОСТОЙ ПАМП / ДАМП
+                if abs(percent) >= THRESHOLD and key not in sent_pump_dump:
                     direction = "ПАМП" if percent > 0 else "ДАМП"
                     emoji = "🔥" if percent > 0 else "❄️"
                     send_msg(f"{emoji} <b>ПРОСТОЙ {direction} {percent:+.2f}%</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
-                    sent_pump_dump.add(pump_key)
+                    sent_pump_dump.add(key)
 
-                # Условия
-                cond_key = (symbol, candle_ts, "cond")
-                if cond_key in sent_condition: continue
-
-                conditions = []
-
-                if funding_rate < -0.0005:
-                    conditions.append(f"💰 Funding: {funding_rate*100:.4f}%")
-
-                rsi = calculate_rsi(closes)
-                if rsi < 50:                                      # ← как ты хотел
-                    conditions.append(f"📉 RSI(14): {rsi:.1f}")
-
-                if calculate_cvd(ohlcv, sensitivity=1.5):        # ← подкрутили чувствительность
-                    conditions.append("🔄 CVD разворот вверх")
-
-                if ohlcv[-1][5] > ohlcv[-2][5] * 1.4 and current_price > ohlcv[-1][1]:
-                    conditions.append("📈 Объём +40% и бычья свеча")
-
+                # 3. СИЛЬНЫЙ ЛОНГ (3+ условий)
+                long_conditions = 0
+                if funding_rate < -0.0005: long_conditions += 1
+                if calculate_rsi([c[4] for c in ohlcv]) < 50: long_conditions += 1
+                if calculate_cvd_long(ohlcv): long_conditions += 1
+                if ohlcv[-1][5] > ohlcv[-2][5] * 1.4 and current_price > ohlcv[-1][1]: long_conditions += 1
                 low_6h = min(c[3] for c in ohlcv[-6:])
-                if abs(current_price - low_6h) / low_6h < 0.025:
-                    conditions.append("🛡️ Цена у поддержки")
+                if abs(current_price - low_6h) / low_6h < 0.025: long_conditions += 1
 
-                count = len(conditions)
+                if long_conditions >= 3:
+                    send_msg(f"🚨 <b>СИЛЬНЫЙ ЛОНГ ({long_conditions}/5)</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
 
-                if count >= 3:
-                    send_msg(f"🚨 <b>СИЛЬНЫЙ СИГНАЛ ({count}/5)</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
-                elif count >= 1:
-                    send_msg(f"📡 <b>Слабый сигнал ({count}/5)</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
+                # 4. СИЛЬНЫЙ ШОРТ (4+ условий)
+                short_conditions = 0
+                if funding_rate > 0.0005: short_conditions += 1
+                if calculate_rsi([c[4] for c in ohlcv]) > 70: short_conditions += 1
+                if calculate_cvd_short(ohlcv): short_conditions += 1
+                if ohlcv[-1][5] > ohlcv[-2][5] * 1.4 and current_price < ohlcv[-1][1]: short_conditions += 1
+                high_6h = max(c[2] for c in ohlcv[-6:])
+                if abs(current_price - high_6h) / high_6h < 0.025: short_conditions += 1
 
-                sent_condition.add(cond_key)
+                if short_conditions >= 4:
+                    send_msg(f"❄️ <b>СИЛЬНЫЙ ШОРТ ({short_conditions}/5)</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
 
             except:
                 continue
