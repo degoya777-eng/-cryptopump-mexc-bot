@@ -10,120 +10,126 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Бот живой! (4 независимых сигнала)"
+    return "✅ Бот живой! v3.4"
 
-# ================= НАСТРОЙКИ =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 THRESHOLD = 7.0
+TOP_SYMBOLS = 50
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
     print("❌ Ошибка: добавь TELEGRAM_TOKEN и CHAT_ID")
     exit()
-# ============================================
 
 exchange = ccxt.mexc()
 markets = exchange.load_markets()
-symbols = [m['symbol'] for m in markets.values() 
-           if m.get('active') and m.get('type') == 'swap' and m.get('quote') == 'USDT']
 
-print(f"✅ Бот запущен — 4 независимых типа сигналов ({len(symbols)} фьючерсов)")
+# Топ-50 самых ликвидных
+sorted_markets = sorted(
+    [m for m in markets.values() if m.get('active') and m.get('type') == 'swap' and m.get('quote') == 'USDT'],
+    key=lambda x: float(x.get('info', {}).get('volume24', 0) or 0),
+    reverse=True
+)
+symbols = [m['symbol'] for m in sorted_markets[:TOP_SYMBOLS]]
 
-sent_alerts = set()   # для ±7%
-sent_condition_alerts = set()  # для слабых и сильных сигналов
+print(f"✅ Бот запущен (топ-{TOP_SYMBOLS} самых ликвидных фьючерсов)")
+
+sent_pump_dump = set()
+sent_condition = set()
+prev_oi = {}
+
+def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    gains = [max(0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
+    losses = [max(0, closes[i-1] - closes[i]) for i in range(1, len(closes))]
+    avg_gain = sum(gains[-period:]) / period or 0.0001
+    avg_loss = sum(losses[-period:]) / period or 0.0001
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+def calculate_cvd(ohlcv, sensitivity=1.5):   # ← подкрутили до 1.5 (меньше ложных)
+    if len(ohlcv) < 6:
+        return False
+    cvd = []
+    cumulative = 0.0
+    for c in ohlcv:
+        delta = c[5] if c[4] >= c[1] else -c[5]
+        cumulative += delta
+        cvd.append(cumulative)
+    # Разворот: падал → развернулся вверх
+    return (cvd[-3] > cvd[-2] < cvd[-1]) and cvd[-1] > 0
+
+def send_msg(text):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except: pass
 
 def bot_loop():
+    send_msg("🤖 <b>MEXC Signal Bot v3.4 запущен!</b>\nТоп-50 ликвидных фьючерсов\nCVD sensitivity = 1.5")
+
     while True:
         for symbol in symbols:
             try:
                 ticker = exchange.fetch_ticker(symbol)
                 current_price = ticker['last']
-                ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=7)
-                if len(ohlcv) < 7: continue
+                funding_rate = float(ticker.get('info', {}).get('fundingRate', 0) or 0)
 
+                ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=20)
+                if len(ohlcv) < 8: continue
+
+                closes = [c[4] for c in ohlcv]
                 prev_close = ohlcv[-2][4]
                 candle_ts = ohlcv[-1][0]
                 percent = (current_price - prev_close) / prev_close * 100
+                time_str = datetime.utcfromtimestamp(candle_ts / 1000).strftime('%d.%m %H:%M UTC')
+                tv = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
 
-                alert_key = (symbol, candle_ts)
-
-                # ================= 1 & 2. ПРОСТОЙ ПАМП / ДАМП (±7%) =================
-                if abs(percent) >= THRESHOLD and alert_key not in sent_alerts:
+                # Простой памп / дамп
+                pump_key = (symbol, candle_ts)
+                if abs(percent) >= THRESHOLD and pump_key not in sent_pump_dump:
                     direction = "ПАМП" if percent > 0 else "ДАМП"
                     emoji = "🔥" if percent > 0 else "❄️"
-                    text = f"""{emoji} ПРОСТОЙ {direction} +{abs(percent):.2f}% В МОМЕНТЕ
+                    send_msg(f"{emoji} <b>ПРОСТОЙ {direction} {percent:+.2f}%</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
+                    sent_pump_dump.add(pump_key)
 
-Монета: {symbol}
-Цена: {current_price:.8f}
-Изменение: {percent:+.2f}%
-Время: {datetime.utcfromtimestamp(candle_ts/1000).strftime('%d.%m %H:%M UTC')}
+                # Условия
+                cond_key = (symbol, candle_ts, "cond")
+                if cond_key in sent_condition: continue
 
-🔗 График: https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"""
+                conditions = []
 
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                                  json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
-                    sent_alerts.add(alert_key)
+                if funding_rate < -0.0005:
+                    conditions.append(f"💰 Funding: {funding_rate*100:.4f}%")
 
-                # ================= 3 & 4. СЛАБЫЙ И СИЛЬНЫЙ СИГНАЛ (по условиям) =================
-                condition_key = (symbol, candle_ts, "condition")
+                rsi = calculate_rsi(closes)
+                if rsi < 50:                                      # ← как ты хотел
+                    conditions.append(f"📉 RSI(14): {rsi:.1f}")
 
-                if condition_key not in sent_condition_alerts:
-                    # ----- Подсчёт условий -----
-                    conditions_met = 0
+                if calculate_cvd(ohlcv, sensitivity=1.5):        # ← подкрутили чувствительность
+                    conditions.append("🔄 CVD разворот вверх")
 
-                    # 1. Funding Rate < -0.05%
-                    funding = exchange.fetch_funding_rate(symbol)
-                    if funding.get('fundingRate', 0) * 100 < -0.05:
-                        conditions_met += 1
+                if ohlcv[-1][5] > ohlcv[-2][5] * 1.4 and current_price > ohlcv[-1][1]:
+                    conditions.append("📈 Объём +40% и бычья свеча")
 
-                    # 2. RSI(30) < 50 и разворачивается вверх
-                    closes = [c[4] for c in ohlcv]
-                    rsi30 = 50  # заглушка (можно доработать позже)
-                    if rsi30 < 50:  # пока упрощённо
-                        conditions_met += 1
+                low_6h = min(c[3] for c in ohlcv[-6:])
+                if abs(current_price - low_6h) / low_6h < 0.025:
+                    conditions.append("🛡️ Цена у поддержки")
 
-                    # 3. Open Interest растёт
-                    oi_now = exchange.fetch_open_interest(symbol)['openInterest']
-                    oi_prev = exchange.fetch_open_interest_history(symbol, '1h', limit=2)[0]['openInterest']
-                    if (oi_now - oi_prev) / oi_prev * 100 > 3:
-                        conditions_met += 1
+                count = len(conditions)
 
-                    # 4. Объём растёт на зелёной свече
-                    volume_growth = ohlcv[-1][5] > ohlcv[-2][5] * 1.3
-                    is_green = current_price > ohlcv[-1][1]
-                    if volume_growth and is_green:
-                        conditions_met += 1
+                if count >= 3:
+                    send_msg(f"🚨 <b>СИЛЬНЫЙ СИГНАЛ ({count}/5)</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
+                elif count >= 1:
+                    send_msg(f"📡 <b>Слабый сигнал ({count}/5)</b>\nМонета: <b>{symbol}</b>\nЦена: {current_price:.8f}\nВремя: {time_str}\n🔗 <a href='{tv}'>График</a>")
 
-                    # 5. Цена у уровня поддержки
-                    low_6h = min(c[3] for c in ohlcv[-6:])
-                    if abs(current_price - low_6h) / low_6h < 0.02:
-                        conditions_met += 1
-
-                    # Отправка сигнала
-                    if conditions_met >= 3:
-                        text = f"""🚨 СИЛЬНЫЙ СИГНАЛ ({conditions_met}/5 условий)
-
-Монета: {symbol}
-Цена: {current_price:.8f}
-Условий: {conditions_met}
-Время: {datetime.utcfromtimestamp(candle_ts/1000).strftime('%d.%m %H:%M UTC')}"""
-                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
-                        sent_condition_alerts.add(condition_key)
-
-                    elif 1 <= conditions_met <= 2:
-                        text = f"""📡 СЛАБЫЙ СИГНАЛ ({conditions_met}/5 условий)
-
-Монета: {symbol}
-Цена: {current_price:.8f}
-Условий: {conditions_met}
-Время: {datetime.utcfromtimestamp(candle_ts/1000).strftime('%d.%m %H:%M UTC')}"""
-                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
-                        sent_condition_alerts.add(condition_key)
+                sent_condition.add(cond_key)
 
             except:
-                pass
+                continue
 
         time.sleep(300)
 
