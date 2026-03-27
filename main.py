@@ -7,39 +7,36 @@ from datetime import datetime, timezone
 from flask import Flask
 import threading
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Бот v4.1 LIVE! (90s interval + Funding)"
+    return "✅ Бот v4.2 работает! (5 условий + % Funding)"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 THRESHOLD = 7.0
 
-if not TELEGRAM_TOKEN or not CHAT_ID:
-    logging.error("❌ Ошибка: проверь TELEGRAM_TOKEN и CHAT_ID")
-    exit()
-
-# Инициализация MEXC
 exchange = ccxt.mexc({'enableRateLimit': True})
+
+def get_funding_status(val):
+    abs_val = abs(val)
+    if abs_val < 0.0003: return "🟢" # Нейтральный
+    if abs_val < 0.001: return "⚠️"  # Повышенный
+    return "🚨" # Экстремальный
 
 def send_msg(text):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logging.error(f"Ошибка TG: {e}")
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except: pass
 
 def calculate_rsi_wilder(closes, period=14):
     if len(closes) < period + 1: return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
+    gains = [max(0, d) for d in deltas]
+    losses = [max(0, -d) for d in deltas]
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
     for i in range(period, len(gains)):
@@ -63,80 +60,70 @@ def calculate_cvd_logic(ohlcv, mode='long'):
 
 def bot_loop():
     sent_signals = set()
-    logging.info("Мониторинг запущен (интервал 90с)...")
-
     while True:
         try:
             markets = exchange.load_markets()
-            # Берем только активные фьючерсы USDT
-            all_symbols = [m['symbol'] for m in markets.values() if m.get('active') and m.get('type') == 'swap' and m.get('quote') == 'USDT']
-            symbols = all_symbols[:50] 
+            symbols = [m['symbol'] for m in markets.values() if m.get('active') and m.get('type') == 'swap' and m.get('quote') == 'USDT'][:50]
 
             for symbol in symbols:
                 try:
                     ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=30)
                     if len(ohlcv) < 20: continue
-
                     ticker = exchange.fetch_ticker(symbol)
-                    current_price = ticker['last']
+                    
+                    price = ticker['last']
                     funding = float(ticker.get('info', {}).get('fundingRate', 0) or 0)
+                    f_pct = funding * 100
+                    f_status = get_funding_status(funding)
                     
-                    last_candle = ohlcv[-1]
+                    ts = ohlcv[-1][0]
                     prev_close = ohlcv[-2][4]
-                    candle_ts = last_candle[0]
-                    percent = (current_price - prev_close) / prev_close * 100
-                    
-                    tv_link = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
-                    rsi_val = calculate_rsi_wilder([c[4] for c in ohlcv])
+                    percent = (price - prev_close) / prev_close * 100
+                    rsi = calculate_rsi_wilder([c[4] for c in ohlcv])
+                    tv = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
 
-                    # Уникальные ключи для блокировки повторов в течение часа
-                    p_key = (symbol, candle_ts, 'p')
-                    l_key = (symbol, candle_ts, 'l')
-                    s_key = (symbol, candle_ts, 's')
+                    # --- ЛОГИКА LONG ---
+                    l_count = 0
+                    if funding < -0.0005: l_count += 1
+                    if rsi < 45: l_count += 1
+                    if calculate_cvd_logic(ohlcv, 'long'): l_count += 1
+                    if ohlcv[-1][5] > (sum(c[5] for c in ohlcv[-6:-1])/5) * 1.3: l_count += 1
+                    low_6h = min(c[3] for c in ohlcv[-6:])
+                    if (price - low_6h) / low_6h < 0.02: l_count += 1 # 5-е условие: цена у дна 6ч
 
-                    # --- 1. ПАМП / ДАМП ---
-                    if abs(percent) >= THRESHOLD and p_key not in sent_signals:
-                        emoji = "🔥 ПАМП" if percent > 0 else "❄️ ДАМП"
-                        send_msg(f"<b>{emoji} {percent:+.2f}%</b>\nМонета: {symbol}\nЦена: {current_price}\nФандинг: <code>{funding:.4f}</code>\n🔗 <a href='{tv_link}'>График</a>")
-                        sent_signals.add(p_key)
-
-                    # --- 2. СИЛЬНЫЙ ЛОНГ ---
-                    l_score = 0
-                    if funding < -0.0005: l_score += 1
-                    if rsi_val < 45: l_score += 1
-                    if calculate_cvd_logic(ohlcv, 'long'): l_score += 1
-                    if last_candle[5] > (sum(c[5] for c in ohlcv[-6:-1])/5) * 1.3: l_score += 1
-                    
-                    if l_score >= 3 and l_key not in sent_signals:
-                        send_msg(f"🚨 <b>СИЛЬНЫЙ ЛОНГ ({l_score}/4)</b>\nМонета: {symbol}\nRSI: {rsi_val:.1f}\nФандинг: <code>{funding:.4f}</code>\n🔗 <a href='{tv_link}'>График</a>")
+                    l_key = (symbol, ts, 'long')
+                    if l_count >= 3 and l_key not in sent_signals:
+                        send_msg(f"🚨 <b>СИЛЬНЫЙ ЛОНГ ({l_count}/5)</b>\nМонета: {symbol}\nRSI: {rsi:.1f}\nФандинг: {f_status} <code>{f_pct:.4f}%</code>\n🔗 <a href='{tv}'>График</a>")
                         sent_signals.add(l_key)
 
-                    # --- 3. СИЛЬНЫЙ ШОРТ ---
-                    s_score = 0
-                    if funding > 0.0005: s_score += 1
-                    if rsi_val > 65: s_score += 1
-                    if calculate_cvd_logic(ohlcv, 'short'): s_score += 1
-                    if last_candle[5] > (sum(c[5] for c in ohlcv[-6:-1])/5) * 1.3: s_score += 1
+                    # --- ЛОГИКА SHORT ---
+                    s_count = 0
+                    if funding > 0.0005: s_count += 1
+                    if rsi > 65: s_count += 1
+                    if calculate_cvd_logic(ohlcv, 'short'): s_count += 1
+                    if ohlcv[-1][5] > (sum(c[5] for c in ohlcv[-6:-1])/5) * 1.3: s_count += 1
+                    high_6h = max(c[2] for c in ohlcv[-6:])
+                    if (high_6h - price) / price < 0.02: s_count += 1 # 5-е условие: цена у пика 6ч
 
-                    if s_score >= 3 and s_key not in sent_signals:
-                        send_msg(f"❄️ <b>СИЛЬНЫЙ ШОРТ ({s_score}/4)</b>\nМонета: {symbol}\nRSI: {rsi_val:.1f}\nФандинг: <code>{funding:.4f}</code>\n🔗 <a href='{tv_link}'>График</a>")
+                    s_key = (symbol, ts, 'short')
+                    if s_count >= 3 and s_key not in sent_signals:
+                        send_msg(f"❄️ <b>СИЛЬНЫЙ ШОРТ ({s_count}/5)</b>\nМонета: {symbol}\nRSI: {rsi:.1f}\nФандинг: {f_status} <code>{f_pct:.4f}%</code>\n🔗 <a href='{tv}'>График</a>")
                         sent_signals.add(s_key)
 
-                    time.sleep(0.6) # Защита от Rate Limit
+                    # ПАМП/ДАМП
+                    p_key = (symbol, ts, 'p')
+                    if abs(percent) >= THRESHOLD and p_key not in sent_signals:
+                        dir_text = "ПАМП 🔥" if percent > 0 else "ДАМП ❄️"
+                        send_msg(f"<b>{dir_text} {percent:+.2f}%</b>\nМонета: {symbol}\nФандинг: {f_status} <code>{f_pct:.4f}%</code>\n🔗 <a href='{tv}'>График</a>")
+                        sent_signals.add(p_key)
 
-                except Exception: continue
+                    time.sleep(0.6)
+                except: continue
 
-            # Чистка старых сигналов (старше 24ч)
-            now_ms = time.time() * 1000
-            sent_signals = {k for k in sent_signals if k[1] > now_ms - 86400000}
-            
-            time.sleep(90) # Интервал проверки
-        except Exception as e:
-            logging.error(f"Ошибка цикла: {e}")
-            time.sleep(30)
+            sent_signals = {k for k in sent_signals if k[1] > (time.time()*1000 - 86400000)}
+            time.sleep(90)
+        except: time.sleep(30)
 
 threading.Thread(target=bot_loop, daemon=True).start()
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
