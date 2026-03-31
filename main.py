@@ -13,11 +13,11 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     # Эта страница нужна, чтобы Uprobot дергал бота и не давал Render уснуть
-    return f"✅ Бот v5.1 АКТИВЕН. (30m Pump | 4H Signals | MA50). Время сервера: {datetime.now().strftime('%H:%M:%S')}"
+    return f"✅ Бот v5.2 АКТИВЕН. (30m Pump | 4H Signals | MA50 | Top-120 Vol). Время сервера: {datetime.now().strftime('%H:%M:%S')}"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-THRESHOLD = 7.0
+THRESHOLD = 7.0 # Порог для пампа/дампа на 30м
 
 # Таймаут увеличен до 30 сек, чтобы бот не падал при долгом ответе MEXC
 exchange = ccxt.mexc({
@@ -67,22 +67,34 @@ def calculate_cvd_logic(ohlcv, mode='long'):
 
 def bot_loop():
     sent_signals = {} 
-    logging.info("Мульти-таймфрейм мониторинг (v5.1 БРОНЯ) запущен.")
+    logging.info("Мульти-таймфрейм мониторинг (v5.2 ТОП-ОБЪЕМЫ) запущен.")
     
     while True: # ГЛОБАЛЬНЫЙ ЦИКЛ (Бот никогда не должен из него выходить)
         try:
             try:
                 exchange.load_markets()
+                # 1. Получаем тикеры ВСЕХ монет разом
+                tickers = exchange.fetch_tickers()
             except Exception as e:
                 logging.error(f"Ошибка загрузки рынков MEXC: {e}. Пропуск цикла.")
                 time.sleep(10)
                 continue # Возвращаемся в начало цикла, если биржа не отвечает
 
-            symbols = [m['symbol'] for m in exchange.markets.values() 
-                       if m.get('active') and m.get('type') == 'swap' and m.get('quote') == 'USDT'][:50]
+            # 2. Фильтруем только активные USDT фьючерсы и собираем их объемы
+            active_swaps = []
+            for symbol, ticker_data in tickers.items():
+                market = exchange.markets.get(symbol)
+                if market and market.get('active') and market.get('type') == 'swap' and market.get('quote') == 'USDT':
+                    vol = ticker_data.get('quoteVolume', 0)
+                    if vol is None: vol = 0
+                    active_swaps.append({'symbol': symbol, 'vol': vol})
+            
+            # 3. Сортируем по объему торгов (от большего к меньшему) и берем Топ-120
+            active_swaps.sort(key=lambda x: x['vol'], reverse=True)
+            symbols = [x['symbol'] for x in active_swaps][:120] 
 
             for symbol in symbols:
-                try: # Локальный try/except для каждой монеты. Если одна монета глючит, другие работают.
+                try: # Локальный try/except. Если одна монета глючит, другие работают.
                     # 1. ЖИВАЯ ЦЕНА В МОМЕНТЕ
                     ticker = exchange.fetch_ticker(symbol)
                     price = ticker['last'] # LIVE цена
@@ -166,7 +178,7 @@ def bot_loop():
                         send_msg(msg)
                         sent_signals[p_key] = time.time()
 
-                    time.sleep(0.4) # Защита от бана IP со стороны MEXC
+                    time.sleep(0.3) # Защита от бана IP со стороны MEXC
                 except Exception as e:
                     # Ошибка по одной монете не сломает весь скрипт
                     continue
@@ -175,7 +187,7 @@ def bot_loop():
             now = time.time()
             sent_signals = {k: v for k, v in sent_signals.items() if v > (now - 86400)}
             
-            time.sleep(90) # Ждем 90 сек перед новым кругом
+            time.sleep(60) # Спим 1 минуту перед новым кругом поиска
             
         except Exception as e:
             # Если сломалось что-то глобальное (например, интернет на сервере пропал)
