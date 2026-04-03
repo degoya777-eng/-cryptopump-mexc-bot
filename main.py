@@ -3,116 +3,118 @@ import requests
 import time
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 from flask import Flask
 
-# Настройка логов, чтобы видеть работу в консоли Render/Heroku
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"🚀 SNIPER v9.1 (STABLE) ACTIVE. Time: {datetime.now().strftime('%H:%M:%S')}"
+    return f"🚀 SNIPER v9.3 (VOLUME) ACTIVE. Time: {datetime.now().strftime('%H:%M:%S')}"
 
-# --- НАСТРОЙКИ ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 THRESHOLD = 7.0 
 
-# Инициализация MEXC
-exchange = ccxt.mexc({
-    'enableRateLimit': True, 
-    'timeout': 20000, 
-    'options': {'defaultType': 'swap'}
-})
-
+exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
 sent_signals = {}
 
 def send_msg(text):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        logging.error(f"TG Error: {e}")
+    except: pass
 
-def check_logic(symbol, tf):
-    """Логика Open-High для моментального захвата импульса"""
-    try:
-        # Запрашиваем всего 2 свечи (минимальный вес данных)
-        ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=2)
-        if not ohlcv or len(ohlcv) < 2: return
-        
-        o = ohlcv[-1][1]  # Открытие текущей свечи
-        h = ohlcv[-1][2]  # Максимум (High) в моменте
-        c = ohlcv[-1][4]  # Текущая цена
-        
-        # Главная формула: считаем прострел вверх (памп)
-        spike_up = ((h - o) / o) * 100
-        # Считаем прострел вниз (дамп)
-        spike_down = ((o - ohlcv[-1][3]) / o) * 100 
-        
-        # Проверка на Памп
-        if spike_up >= THRESHOLD:
-            send_alert(symbol, tf, spike_up, c, h, o, "ПАМП 🔥", ohlcv[-1][0])
-            
-        # Проверка на Дамп
-        elif spike_down >= THRESHOLD:
-            send_alert(symbol, tf, -spike_down, c, ohlcv[-1][3], o, "ДАМП ❄️", ohlcv[-1][0])
-
-    except:
-        pass
-
-def send_alert(symbol, tf, percent, price, peak, open_p, label, ts):
+def send_alert(symbol, tf, percent, price, peak, open_p, vol_curr, vol_rel, label, ts):
     key = f"{symbol}_{ts}_{tf}"
     if key not in sent_signals:
         tv = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
+        
+        # Индикатор силы объема
+        vol_emoji = "💎 СИЛЬНЫЙ" if vol_rel >= 3 else "⚠️ СЛАБЫЙ"
+        
         msg = (f"<b>{label} {percent:+.2f}% ({tf})</b>\n"
                f"Монета: <b>{symbol}</b>\n"
-               f"Цена сейчас: <code>{price}</code>\n"
-               f"Пик (High/Low): <code>{peak}</code>\n"
-               f"Открытие свечи: <code>{open_p}</code>\n"
+               f"Цена: <code>{price}</code> | Пик: <code>{peak}</code>\n"
+               f"───────────────────\n"
+               f"📊 <b>Объем:</b> ${vol_curr:,.0f}\n"
+               f"📈 <b>Рост объема:</b> x{vol_rel:.1f} {vol_emoji}\n"
                f"───────────────────\n"
                f"🔗 <a href='{tv}'>ОТКРЫТЬ ГРАФИК</a>")
+        
         send_msg(msg)
         sent_signals[key] = time.time()
-        logging.info(f"Сигнал отправлен: {symbol} {tf}")
+        logging.info(f"СИГНАЛ: {symbol} {tf} Vol x{vol_rel:.1f}")
+
+def check_logic(symbol):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=3) # Берем 3 свечи для замера среднего объема
+        if not ohlcv or len(ohlcv) < 3: return
+        
+        curr, prev, pprev = ohlcv[-1], ohlcv[-2], ohlcv[-3]
+        price_now = curr[4]
+        
+        # --- 1H ДАННЫЕ ---
+        ts_1h = curr[0]
+        o_1h, h_1h, l_1h, v_1h = curr[1], curr[2], curr[3], curr[5]
+        v_1h_prev = prev[5]
+        # Считаем объем в долларах (приблизительно)
+        v_usdt_1h = v_1h * price_now
+        v_rel_1h = v_1h / v_1h_prev if v_1h_prev > 0 else 1
+        
+        s_up_1h = ((h_1h - o_1h) / o_1h) * 100
+        s_down_1h = ((o_1h - l_1h) / o_1h) * 100
+        
+        if s_up_1h >= THRESHOLD:
+            send_alert(symbol, "1H", s_up_1h, price_now, h_1h, o_1h, v_usdt_1h, v_rel_1h, "ПАМП 🔥", ts_1h)
+        elif s_down_1h >= THRESHOLD:
+            send_alert(symbol, "1H", -s_down_1h, price_now, l_1h, o_1h, v_usdt_1h, v_rel_1h, "ДАМП ❄️", ts_1h)
+
+        # --- 2H ДАННЫЕ ---
+        ts_2h_start = (ts_1h // 7200000) * 7200000
+        if ts_1h == ts_2h_start:
+            o_2h, h_2h, l_2h, v_2h = o_1h, h_1h, l_1h, v_1h
+            v_2h_prev = pprev[5] + prev[5] # Складываем два часа до этого
+        else:
+            o_2h = prev[1]
+            h_2h = max(prev[2], h_1h)
+            l_2h = min(prev[3], l_1h)
+            v_2h = prev[5] + v_1h
+            v_2h_prev = ohlcv[-3][5] # Для простоты берем пред-предыдущий блок
+            
+        v_usdt_2h = v_2h * price_now
+        v_rel_2h = v_2h / v_2h_prev if v_2h_prev > 0 else 1
+        
+        s_up_2h = ((h_2h - o_2h) / o_2h) * 100
+        s_down_2h = ((o_2h - l_2h) / o_2h) * 100
+        
+        if s_up_2h >= THRESHOLD:
+            send_alert(symbol, "2H", s_up_2h, price_now, h_2h, o_2h, v_usdt_2h, v_rel_2h, "ПАМП 🔥", ts_2h_start)
+        elif s_down_2h >= THRESHOLD:
+            send_alert(symbol, "2H", -s_down_2h, price_now, l_2h, o_2h, v_usdt_2h, v_rel_2h, "ДАМП ❄️", ts_2h_start)
+
+    except: pass
 
 def sniper_loop():
-    logging.info("Снайпер v9.1 запущен...")
     while True:
         try:
-            # 1. Обновляем список монет (на случай листингов)
-            markets = exchange.load_markets()
-            symbols = [s for s, m in markets.items() if m['active'] and m['type'] == 'swap' and m['quote'] == 'USDT']
-            
-            logging.info(f"Начинаю обход {len(symbols)} монет...")
-            
+            exchange.load_markets()
+            symbols = [s for s, m in exchange.markets.items() if m['active'] and m['type'] == 'swap' and m['quote'] == 'USDT']
             for symbol in symbols:
-                check_logic(symbol, '1h')
-                check_logic(symbol, '2h')
-                
-                # Безопасная пауза между монетами (чтобы не забанили)
-                time.sleep(0.06) 
-            
-            # 2. Очистка памяти от старых сигналов (старше 12 часов)
+                check_logic(symbol)
+                time.sleep(0.05)
             now = time.time()
             for k in list(sent_signals.keys()):
-                if now - sent_signals[k] > 43200:
-                    del sent_signals[k]
-            
-            # 3. Безопасная пауза между кругами
-            logging.info("Круг завершен. Сплю 10 секунд...")
+                if now - sent_signals[k] > 43200: del sent_signals[k]
             time.sleep(10)
-            
         except Exception as e:
-            logging.error(f"Ошибка в цикле: {e}")
+            logging.error(f"Loop Error: {e}")
             time.sleep(30)
 
-# Запуск в отдельном потоке
 threading.Thread(target=sniper_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # Порт для Render или других хостингов
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
