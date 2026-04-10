@@ -7,19 +7,47 @@ from datetime import datetime
 import threading
 from flask import Flask
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
+# Глобальные переменные для мониторинга
+stats = {
+    "start_time": datetime.now(),
+    "iterations": 0,
+    "errors": 0,
+    "signals_sent": 0,
+    "last_iteration_time": None
+}
+
 @app.route('/')
 def home():
-    return f"🚀 SNIPER v9.3 (VOLUME) ACTIVE. Time: {datetime.now().strftime('%H:%M:%S')}"
+    uptime = str(datetime.now() - stats["start_time"]).split('.')[0]
+    return (f"✅ OK Uptime: {uptime} "
+            f"Итераций: {stats['iterations']} "
+            f"Ошибок: {stats['errors']} "
+            f"Сигналов: {stats['signals_sent']} "
+            f"Последняя: {stats['last_iteration_time']}")
 
+@app.route('/health')
+def health():
+    return "OK", 200
+
+# Настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 THRESHOLD = 7.0 
 
-exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 20000, 'options': {'defaultType': 'swap'}})
+# Подключаем MEXC
+exchange = ccxt.mexc({
+    'enableRateLimit': True, 
+    'timeout': 20000, 
+    'options': {'defaultType': 'swap'}
+})
+
+active_symbols_global = []
 sent_signals = {}
+last_market_update = 0
 
 def send_msg(text):
     try:
@@ -27,89 +55,113 @@ def send_msg(text):
         requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
     except: pass
 
-def send_alert(symbol, tf, percent, price, peak, open_p, vol_curr, vol_rel, label, ts):
+def send_alert(symbol, tf, percent, price, o, h, l, vol_curr, vol_rel, label, ts):
     key = f"{symbol}_{ts}_{tf}"
     if key not in sent_signals:
         tv = f"https://www.tradingview.com/chart/?symbol=MEXC:{symbol.replace('/', '').replace(':USDT', '.P')}"
         
-        # Индикатор силы объема
-        vol_emoji = "💎 СИЛЬНЫЙ" if vol_rel >= 3 else "⚠️ СЛАБЫЙ"
+        # Расчет дисбаланса
+        range_hl = h - l if (h - l) > 0 else 0.00000001
+        bull_power = ((price - l) / range_hl) * 100
+        bear_power = 100 - bull_power
         
+        bias_text = f"🟩 Быки {bull_power:.0f}%" if bull_power > 70 else f"🟥 Медведи {bear_power:.0f}%" if bear_power > 70 else "⚖️ Нейтрально"
+        peak = h if "ПАМП" in label else l
+
         msg = (f"<b>{label} {percent:+.2f}% ({tf})</b>\n"
                f"Монета: <b>{symbol}</b>\n"
                f"Цена: <code>{price}</code> | Пик: <code>{peak}</code>\n"
                f"───────────────────\n"
-               f"📊 <b>Объем:</b> ${vol_curr:,.0f}\n"
-               f"📈 <b>Рост объема:</b> x{vol_rel:.1f} {vol_emoji}\n"
+               f"📊 Объём: ${vol_curr:,.0f}\n"
+               f"🎯 Дисбаланс: {bias_text}\n"
                f"───────────────────\n"
-               f"🔗 <a href='{tv}'>ОТКРЫТЬ ГРАФИК</a>")
+               f"🔗 <a href='{tv}'>TRADINGVIEW</a>")
         
         send_msg(msg)
         sent_signals[key] = time.time()
-        logging.info(f"СИГНАЛ: {symbol} {tf} Vol x{vol_rel:.1f}")
+        stats["signals_sent"] += 1
 
-def check_logic(symbol):
+def process_heavy_logic(symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=3) # Берем 3 свечи для замера среднего объема
-        if not ohlcv or len(ohlcv) < 3: return
+        # Берем 5 свечей, чтобы хватило на 4H (текущая + 3 прошлых) и сравнения объемов
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=6)
+        if not ohlcv or len(ohlcv) < 5: return
         
-        curr, prev, pprev = ohlcv[-1], ohlcv[-2], ohlcv[-3]
-        price_now = curr[4]
+        price_now = ohlcv[-1][4]
         
-        # --- 1H ДАННЫЕ ---
-        ts_1h = curr[0]
-        o_1h, h_1h, l_1h, v_1h = curr[1], curr[2], curr[3], curr[5]
-        v_1h_prev = prev[5]
-        # Считаем объем в долларах (приблизительно)
-        v_usdt_1h = v_1h * price_now
-        v_rel_1h = v_1h / v_1h_prev if v_1h_prev > 0 else 1
-        
-        s_up_1h = ((h_1h - o_1h) / o_1h) * 100
-        s_down_1h = ((o_1h - l_1h) / o_1h) * 100
+        # --- 1H LOGIC ---
+        c1 = ohlcv[-1]
+        o1, h1, l1, v1 = c1[1], c1[2], c1[3], c1[5]
+        s_up_1h = ((h1 - o1) / o1) * 100
+        s_down_1h = ((o1 - l1) / o1) * 100
         
         if s_up_1h >= THRESHOLD:
-            send_alert(symbol, "1H", s_up_1h, price_now, h_1h, o_1h, v_usdt_1h, v_rel_1h, "ПАМП 🔥", ts_1h)
+            send_alert(symbol, "1H", s_up_1h, price_now, o1, h1, l1, v1*price_now, 1.0, "ПАМП 🔥", c1[0])
         elif s_down_1h >= THRESHOLD:
-            send_alert(symbol, "1H", -s_down_1h, price_now, l_1h, o_1h, v_usdt_1h, v_rel_1h, "ДАМП ❄️", ts_1h)
+            send_alert(symbol, "1H", -s_down_1h, price_now, o1, h1, l1, v1*price_now, 1.0, "ДАМП ❄️", c1[0])
 
-        # --- 2H ДАННЫЕ ---
-        ts_2h_start = (ts_1h // 7200000) * 7200000
-        if ts_1h == ts_2h_start:
-            o_2h, h_2h, l_2h, v_2h = o_1h, h_1h, l_1h, v_1h
-            v_2h_prev = pprev[5] + prev[5] # Складываем два часа до этого
-        else:
-            o_2h = prev[1]
-            h_2h = max(prev[2], h_1h)
-            l_2h = min(prev[3], l_1h)
-            v_2h = prev[5] + v_1h
-            v_2h_prev = ohlcv[-3][5] # Для простоты берем пред-предыдущий блок
-            
-        v_usdt_2h = v_2h * price_now
-        v_rel_2h = v_2h / v_2h_prev if v_2h_prev > 0 else 1
-        
-        s_up_2h = ((h_2h - o_2h) / o_2h) * 100
-        s_down_2h = ((o_2h - l_2h) / o_2h) * 100
+        # --- 2H LOGIC (Current + Previous) ---
+        c2_prev = ohlcv[-2]
+        o2h = c2_prev[1]
+        h2h = max(c2_prev[2], h1)
+        l2h = min(c2_prev[3], l1)
+        s_up_2h = ((h2h - o2h) / o2h) * 100
+        s_down_2h = ((o2h - l2h) / o2h) * 100
         
         if s_up_2h >= THRESHOLD:
-            send_alert(symbol, "2H", s_up_2h, price_now, h_2h, o_2h, v_usdt_2h, v_rel_2h, "ПАМП 🔥", ts_2h_start)
+            send_alert(symbol, "2H", s_up_2h, price_now, o2h, h2h, l2h, (c2_prev[5]+v1)*price_now, 1.0, "ПАМП 🔥", c2_prev[0])
         elif s_down_2h >= THRESHOLD:
-            send_alert(symbol, "2H", -s_down_2h, price_now, l_2h, o_2h, v_usdt_2h, v_rel_2h, "ДАМП ❄️", ts_2h_start)
+            send_alert(symbol, "2H", -s_down_2h, price_now, o2h, h2h, l2h, (c2_prev[5]+v1)*price_now, 1.0, "ДАМП ❄️", c2_prev[0])
 
-    except: pass
+        # --- 4H LOGIC (Current + 3 Previous) ---
+        c4_start = ohlcv[-4]
+        o4h = c4_start[1]
+        h4h = max(ohlcv[-4][2], ohlcv[-3][2], ohlcv[-2][2], ohlcv[-1][2])
+        l4h = min(ohlcv[-4][3], ohlcv[-3][3], ohlcv[-2][3], ohlcv[-1][3])
+        v4h_total = sum(s[5] for s in ohlcv[-4:])
+        
+        s_up_4h = ((h4h - o4h) / o4h) * 100
+        s_down_4h = ((o4h - l4h) / o4h) * 100
+        
+        if s_up_4h >= THRESHOLD:
+            send_alert(symbol, "4H", s_up_4h, price_now, o4h, h4h, l4h, v4h_total*price_now, 1.0, "ПАМП 🔥", c4_start[0])
+        elif s_down_4h >= THRESHOLD:
+            send_alert(symbol, "4H", -s_down_4h, price_now, o4h, h4h, l4h, v4h_total*price_now, 1.0, "ДАМП ❄️", c4_start[0])
+            
+    except Exception as e:
+        logging.debug(f"Error processing {symbol}: {e}")
+
+def update_markets():
+    global active_symbols_global, last_market_update
+    try:
+        exchange.load_markets()
+        active_symbols_global = [s for s, m in exchange.markets.items() if m['active'] and m['type'] == 'swap' and m['quote'] == 'USDT']
+        last_market_update = time.time()
+    except Exception as e:
+        stats["errors"] += 1
+        logging.error(f"Market update error: {e}")
 
 def sniper_loop():
+    update_markets() 
     while True:
         try:
-            exchange.load_markets()
-            symbols = [s for s, m in exchange.markets.items() if m['active'] and m['type'] == 'swap' and m['quote'] == 'USDT']
-            for symbol in symbols:
-                check_logic(symbol)
-                time.sleep(0.05)
+            if time.time() - last_market_update > 600:
+                update_markets()
+
+            for symbol in active_symbols_global:
+                process_heavy_logic(symbol)
+            
+            stats["iterations"] += 1
+            stats["last_iteration_time"] = datetime.now().strftime('%H:%M:%S')
+            
+            # Очистка старых сигналов (раз в 12 часов)
             now = time.time()
             for k in list(sent_signals.keys()):
                 if now - sent_signals[k] > 43200: del sent_signals[k]
+            
             time.sleep(10)
         except Exception as e:
+            stats["errors"] += 1
             logging.error(f"Loop Error: {e}")
             time.sleep(30)
 
